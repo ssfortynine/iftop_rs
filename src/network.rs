@@ -12,6 +12,7 @@ use pnet::packet::{
     Packet,
 };
 use crate::app::SharedStats;
+use pnet::ipnetwork::Ipv4Network; 
 
 pub fn get_local_ip(device_name: &str) -> Option<Ipv4Addr> {
     let interfaces = datalink::interfaces();
@@ -25,7 +26,7 @@ pub fn get_local_ip(device_name: &str) -> Option<Ipv4Addr> {
     })
 }
 
-pub fn is_lan_ip(ip: &Ipv4Addr) -> bool {
+pub fn is_rfc1918_private(ip: &Ipv4Addr) -> bool {
     let octets = ip.octets();
     (octets[0] == 192 && octets[1] == 168) ||
     (octets[0] == 10) ||
@@ -39,11 +40,20 @@ pub fn get_default_device() -> Result<(Device, Ipv4Addr), Box<dyn Error>> {
     Ok((device, local_ip))
 }
 
+fn should_track_ip(ip: &Ipv4Addr, filter_cidr: Option<Ipv4Network>) -> bool {
+    match filter_cidr {
+        // If a CIDR is provided (e.g.,
+        Some(network) => network.contains(*ip),
+        None => is_rfc1918_private(ip),
+    }
+}
+
 // Start a background packet capture thread
 pub fn start_capture_thread(
     device: Device, 
     local_ip: Ipv4Addr, 
     stats: Arc<Mutex<SharedStats>>
+    , filter_cidr: Option<Ipv4Network>
 ) -> Result<(), Box<dyn Error>> {
     let mut cap = Capture::from_device(device)?
         .promisc(true)
@@ -70,10 +80,10 @@ pub fn start_capture_thread(
                         }
 
                         // Track per-IP traffic for LAN IPs
-                        if is_lan_ip(&src) {
+                        if should_track_ip(&src, filter_cidr) {
                             *s.traffic_delta.entry(src).or_insert(0) += len;
                         }
-                        if is_lan_ip(&dst) {
+                        if should_track_ip(&dst, filter_cidr) {
                             *s.traffic_delta.entry(dst).or_insert(0) += len;
                         }
                     }
