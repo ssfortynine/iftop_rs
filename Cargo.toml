@@ -1,0 +1,10 @@
+[package]
+name = "iftop_rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pcap = "1.1"
+pnet = "0.34"
+crossterm = "0.27"
+ctrlc = "3.4"
