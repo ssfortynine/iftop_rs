@@ -1,5 +1,5 @@
 [package]
-name = "iftop_rs"
+name = "net_monitor"
 version = "0.1.0"
 edition = "2021"
 
