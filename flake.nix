@@ -23,7 +23,6 @@
           xorg.libXrandr # To use the x11 feature
           libxkbcommon 
           wayland # To use the wayland feature
-          dsniff
           libpcap
         ];
       in
