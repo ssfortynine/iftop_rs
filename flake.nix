@@ -24,6 +24,7 @@
           libxkbcommon 
           wayland # To use the wayland feature
           libpcap
+          dsniff
         ];
       in
       {

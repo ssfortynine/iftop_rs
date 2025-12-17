@@ -1,127 +1,100 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::io::stdout;
-use std::thread;
-use std::time::{Duration, Instant};
-use std::net::Ipv4Addr;
-
+use pcap::{Device, Capture};
 use pnet::packet::ethernet::{EthernetPacket, EtherTypes};
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::Packet;
-
-use pcap::{Capture, Device};
-
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 use crossterm::{execute, terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen}, cursor};
-
-
-// 定义一个结构体来存储流量方向
-#[derive(Hash, Eq, PartialEq, Debug, Clone)]
-struct Connection {
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
-}
+use std::io::stdout;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 获取默认网卡
-    let device = Device::lookup()?.ok_or("No device available")?;
+    // 1. 获取网卡
+    let device = Device::lookup()?.ok_or("No default device found")?;
     println!("Listening on device: {}", device.name);
 
-    // 打开网卡进行数据包捕获
+    // 2. 开启混杂模式抓包
     let mut cap = Capture::from_device(device)?
-        .promisc(true) // 混杂模式，捕获所有流经网卡的数据包
+        .promisc(true) 
         .snaplen(65535)
         .timeout(100)
         .open()?;
 
-    // 共享状态：存储连接和对应字节数
-    // Key: Connnection, Valut: Bytes
-    let stats = Arc::new(Mutex::new(HashMap::<Connection, u64>::new()));
-
-    // 克隆引用方便在UI线程中使用
+    // 统计：IP地址 -> 字节数
+    let stats = Arc::new(Mutex::new(HashMap::<Ipv4Addr, u64>::new()));
     let stats_ui = Arc::clone(&stats);
 
-    // 启动UI线程
+    // 3. UI 线程
     thread::spawn(move || {
-        let _ = execute!(stdout(), EnterAlternateScreen); // 进入备用屏幕
+        let _ = execute!(stdout(), EnterAlternateScreen);
         loop {
             thread::sleep(Duration::from_secs(1));
             let mut map = stats_ui.lock().unwrap();
 
-            // 清屏
-            let _ = execute!(stdout(), Clear(ClearType::All), cursor::MoveTo(0,0));
-            
-            println!("{:<20} -> {:<20} {:>10}", "Source", "Destination", "Bytes/s");
-            println!("{}", "-".repeat(60));
+            let _ = execute!(stdout(), Clear(ClearType::All), cursor::MoveTo(0, 0));
+            println!("{:<20} | {:<15}", "LAN Device IP", "Bandwidth Usage");
+            println!("{}", "-".repeat(40));
 
-            // 将HashMap转为Vec以便排序
-            let mut sorted_conns: Vec<(&Connection, &u64)> = map.iter().collect();
-            // 按流量从小到大排序
-            sorted_conns.sort_by(|a,b| b.1.cmp(a.1));
+            // 排序
+            let mut sorted: Vec<(&Ipv4Addr, &u64)> = map.iter().collect();
+            sorted.sort_by(|a, b| b.1.cmp(a.1));
 
-            // 显示 Top 20
-            for (conn, bytes) in sorted_conns.iter().take(20) {
-                println!("{:<20} -> {:<20} | {}", conn.src, conn.dst, format_bytes(**bytes));
+            // 显示 Top 10
+            for (ip, bytes) in sorted.iter().take(10) {
+                println!("{:<20} | {}", ip, format_bytes(**bytes));
             }
 
-
-            map.clear(); // 清空统计数据以便下一个周期重新统计
+            map.clear();
         }
     });
 
-    // 处理Ctrl+C信号以优雅退出
-    ctrlc::set_handler(move || {
-        let _ = execute!(stdout(), LeaveAlternateScreen); // 离开备用屏幕
+    ctrlc::set_handler(|| {
+        let _ = execute!(stdout(), LeaveAlternateScreen);
         std::process::exit(0);
     })?;
 
-    // 主线程循环捕获数据包
+    // 4. 抓包循环
     loop {
-        // 获取下一个包（可能会因为timout而返回None）
-        match cap.next_packet() {
-            Ok(packet) => {
-                // 解析以太网包
-                if let Some(ethernet) =  EthernetPacket::new(packet.data){
-                    // 只处理IPv4包，简化处理
-                    if ethernet.get_ethertype() == EtherTypes::Ipv4 {
-                        if let Some(ipv4) = Ipv4Packet::new(ethernet.payload()){
-                            let src = ipv4.get_source();
-                            let dst = ipv4.get_destination();
-                            let len = ipv4.get_total_length() as u64;
-                            // 更新统计数据
-                            let mut map = stats.lock().unwrap();
-                            let conn = Connection { src, dst };
-                            *map.entry(conn).or_insert(0) += len;
+        if let Ok(packet) = cap.next_packet() {
+            if let Some(ethernet) = EthernetPacket::new(packet.data) {
+                if ethernet.get_ethertype() == EtherTypes::Ipv4 {
+                    if let Some(ipv4) = Ipv4Packet::new(ethernet.payload()) {
+                        let src = ipv4.get_source();
+                        let dst = ipv4.get_destination();
+                        let len = packet.header.len as u64;
+
+                        let mut map = stats.lock().unwrap();
+
+                        // 简单的启发式逻辑：
+                        // 如果源IP是局域网IP (192.168.x.x)，则记为该IP使用了流量
+                        // 如果目标IP是局域网IP，也记为该IP使用了流量
+                        // 注意：你需要根据你实际的网段修改这里的判断逻辑
+                        if is_lan_ip(&src) {
+                            *map.entry(src).or_insert(0) += len;
+                        }
+                        if is_lan_ip(&dst) {
+                            *map.entry(dst).or_insert(0) += len;
                         }
                     }
                 }
             }
-            Err(pcap::Error::TimeoutExpired) => {
-                // 超时，继续等待下一个包
-                continue;
-            }
-            Err(e) => {
-                println!("Error capturing packet: {}", e);
-                break;
-            }
         }
     }
-    
-    Ok(())
 }
 
-// 辅助函数： 格式化字节数为人类可读形式
+// 辅助函数：判断是否是局域网IP (你需要根据实际情况修改，比如 10.x.x.x 或 172.16.x.x)
+fn is_lan_ip(ip: &Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    // 假设局域网是 192.168.x.x
+    octets[0] == 192 && octets[1] == 168 && octets[2] == 5
+}
+
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
+    const MB: u64 = 1024 * KB;
+    if bytes >= MB { format!("{:.2} MB/s", bytes as f64 / MB as f64) }
+    else if bytes >= KB { format!("{:.2} KB/s", bytes as f64 / KB as f64) }
+    else { format!("{} B/s", bytes) }
 }
-
