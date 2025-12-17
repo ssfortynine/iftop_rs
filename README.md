@@ -23,7 +23,7 @@ nix build
 ```
 2. 进入开发环境
 
-环境会自动配置 rustc, cargo, libpcap, pkg-config 以及必要的 LD_LIBRARY_PATH。
+环境会自动配置 rustc, cargo, libpcap, dsniff, pkg-config 以及必要的 LD_LIBRARY_PATH。
 ```Bash
 nix develop
 # 进入 Shell 后即可直接运行 cargo 命令
@@ -34,9 +34,9 @@ cargo run
 **前置依赖:**
 请确保系统已安装 `libpcap` 开发库。
 
-+ Debian/Ubuntu: `sudo apt install libpcap-dev`
-+ Arch Linux: `sudo pacman -S libpcap`
-+ Fedora: `sudo dnf install libpcap-devel`
++ Debian/Ubuntu: `sudo apt install libpcap-dev dsniff`
++ Arch Linux: `sudo pacman -S libpcap dsniff`
++ Fedora: `sudo dnf install libpcap-devel dsniff`
 
 **构建:**
 ```Bash

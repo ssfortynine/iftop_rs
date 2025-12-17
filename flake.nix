@@ -14,6 +14,7 @@
         deps = with pkgs; [
           cargo
           rustc
+          dsniff
           libpcap
         ];
       in
