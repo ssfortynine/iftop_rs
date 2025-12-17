@@ -1,8 +1,10 @@
+use chrono::Local; // 用于获取当前时间
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use dns_lookup::lookup_addr; // DNS 反向解析
 use pcap::{Capture, Device};
 use pnet::datalink;
 use pnet::packet::{
@@ -14,10 +16,10 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    symbols::Marker, // 引入 Marker 用于盲文显示
+    symbols::Marker,
     text::{Line, Span},
     widgets::{
-        canvas::{Canvas, Line as CanvasLine}, // 引入 Canvas 和 CanvasLine
+        canvas::{Canvas, Line as CanvasLine},
         Block, Borders, Cell, Paragraph, Row, Table,
     },
     Terminal,
@@ -26,7 +28,7 @@ use std::{
     collections::{HashMap, VecDeque},
     error::Error,
     io,
-    net::Ipv4Addr,
+    net::{IpAddr, Ipv4Addr},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -37,7 +39,6 @@ use std::{
 // ----------------------
 const TICK_RATE_MS: u64 = 500;
 const HISTORY_WINDOW_SECS: u64 = 60;
-// 计算历史记录长度：60秒 / 0.5秒 = 120个点
 const MAX_SAMPLES: usize = (HISTORY_WINDOW_SECS * 1000 / TICK_RATE_MS) as usize;
 
 // ----------------------
@@ -50,16 +51,23 @@ struct SharedStats {
     tx_delta: u64,
 }
 
-struct IpHistory {
+// 单个 IP 的详细数据
+struct IpMetrics {
     samples: VecDeque<u64>,
     total_sum: u64,
+    
+    // 新增：峰值记录
+    peak_bps: f64,
+    peak_time: String,
 }
 
-impl IpHistory {
+impl IpMetrics {
     fn new() -> Self {
         Self {
             samples: VecDeque::with_capacity(MAX_SAMPLES),
             total_sum: 0,
+            peak_bps: 0.0,
+            peak_time: "-".to_string(),
         }
     }
 
@@ -72,32 +80,42 @@ impl IpHistory {
             }
         }
         let duration_secs = self.samples.len() as f64 * (TICK_RATE_MS as f64 / 1000.0);
-        if duration_secs == 0.0 {
-            0.0
-        } else {
-            self.total_sum as f64 / duration_secs
+        let current_bps = if duration_secs == 0.0 { 0.0 } else { self.total_sum as f64 / duration_secs };
+
+        // 记录峰值
+        if current_bps > self.peak_bps {
+            self.peak_bps = current_bps;
+            self.peak_time = Local::now().format("%H:%M:%S").to_string();
         }
+
+        current_bps
     }
 }
 
 struct App {
-    // 历史数据
-    rx_history: Vec<f64>, // 改为 f64 以便 Canvas 绘制
+    rx_history: Vec<f64>,
     tx_history: Vec<f64>,
-
     total_rx_bytes: u64,
     total_tx_bytes: u64,
     peak_rx_rate: u64,
     peak_tx_rate: u64,
 
-    ip_histories: HashMap<Ipv4Addr, IpHistory>,
-    top_talkers: Vec<(Ipv4Addr, f64)>,
+    // IP 统计数据
+    ip_stats: HashMap<Ipv4Addr, IpMetrics>,
+    
+    // DNS 缓存：IP -> Hostname (Arc<Mutex<>> 用于跨线程共享)
+    dns_cache: Arc<Mutex<HashMap<Ipv4Addr, String>>>,
+    // 记录已经发起过查询的 IP，避免重复查询
+    dns_query_sent: Vec<Ipv4Addr>,
+
+    // 用于显示的排序列表
+    top_talkers: Vec<(Ipv4Addr, f64, String, f64, String)>, // IP, Current, Hostname, Peak, PeakTime
+    
     last_tick: Instant,
 }
 
 impl App {
     fn new() -> App {
-        // 初始化填满 0，防止图表一开始是空的
         App {
             rx_history: vec![0.0; MAX_SAMPLES],
             tx_history: vec![0.0; MAX_SAMPLES],
@@ -105,7 +123,9 @@ impl App {
             total_tx_bytes: 0,
             peak_rx_rate: 0,
             peak_tx_rate: 0,
-            ip_histories: HashMap::new(),
+            ip_stats: HashMap::new(),
+            dns_cache: Arc::new(Mutex::new(HashMap::new())),
+            dns_query_sent: Vec::new(),
             top_talkers: vec![],
             last_tick: Instant::now(),
         }
@@ -114,44 +134,70 @@ impl App {
     fn on_tick(&mut self, shared_stats: &Arc<Mutex<SharedStats>>) {
         let mut stats = shared_stats.lock().unwrap();
 
-        // 1. 更新全局图表数据 (转为 f64)
+        // 1. 全局图表
         self.rx_history.remove(0);
         self.rx_history.push(stats.rx_delta as f64);
         self.tx_history.remove(0);
         self.tx_history.push(stats.tx_delta as f64);
-
         self.total_rx_bytes += stats.rx_delta;
         self.total_tx_bytes += stats.tx_delta;
 
-        if stats.rx_delta > self.peak_rx_rate {
-            self.peak_rx_rate = stats.rx_delta;
-        }
-        if stats.tx_delta > self.peak_tx_rate {
-            self.peak_tx_rate = stats.tx_delta;
+        if stats.rx_delta > self.peak_rx_rate { self.peak_rx_rate = stats.rx_delta; }
+        if stats.tx_delta > self.peak_tx_rate { self.peak_tx_rate = stats.tx_delta; }
+
+        // 2. IP 统计
+        let mut all_ips: Vec<Ipv4Addr> = self.ip_stats.keys().cloned().collect();
+        for k in stats.traffic_delta.keys() {
+            if !self.ip_stats.contains_key(k) { all_ips.push(*k); }
         }
 
-        // 2. 更新 IP 排行榜
-        let mut all_ips: Vec<Ipv4Addr> = self.ip_histories.keys().cloned().collect();
-        for k in stats.traffic_delta.keys() {
-            if !self.ip_histories.contains_key(k) {
-                all_ips.push(*k);
+        // 3. DNS 触发逻辑
+        let dns_cache_clone = Arc::clone(&self.dns_cache);
+        for ip in &all_ips {
+            // 如果这个IP还没查过 DNS
+            if !self.dns_query_sent.contains(ip) {
+                self.dns_query_sent.push(*ip);
+                let target_ip = *ip;
+                let cache_ref = Arc::clone(&dns_cache_clone);
+                
+                // 启动后台线程查询 DNS，避免阻塞 UI
+                thread::spawn(move || {
+                    // 使用 dns_lookup 库进行反向解析
+                    let hostname = lookup_addr(&IpAddr::V4(target_ip)).unwrap_or_else(|_| target_ip.to_string());
+                    let mut cache = cache_ref.lock().unwrap();
+                    cache.insert(target_ip, hostname);
+                });
             }
         }
 
+        // 4. 更新数据快照
         let mut current_snapshot = Vec::new();
+        let cache_lock = self.dns_cache.lock().unwrap(); // 锁住读取 DNS 结果
+
         for ip in all_ips {
             let bytes_in = *stats.traffic_delta.get(&ip).unwrap_or(&0);
-            let history = self.ip_histories.entry(ip).or_insert_with(IpHistory::new);
-            let avg_bps = history.update(bytes_in);
-            if history.total_sum > 0 {
-                current_snapshot.push((ip, avg_bps));
+            let metrics = self.ip_stats.entry(ip).or_insert_with(IpMetrics::new);
+            let avg_bps = metrics.update(bytes_in);
+
+            if metrics.total_sum > 0 {
+                let hostname = cache_lock.get(&ip).cloned().unwrap_or_else(|| "Resolving...".to_string());
+                current_snapshot.push((
+                    ip, 
+                    avg_bps, 
+                    hostname, 
+                    metrics.peak_bps, 
+                    metrics.peak_time.clone()
+                ));
             } else {
-                self.ip_histories.remove(&ip);
+                self.ip_stats.remove(&ip);
             }
         }
+        
+        // 排序
         current_snapshot.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         self.top_talkers = current_snapshot;
 
+        // 清理
         stats.traffic_delta.clear();
         stats.rx_delta = 0;
         stats.tx_delta = 0;
@@ -162,11 +208,7 @@ fn get_local_ip(device_name: &str) -> Option<Ipv4Addr> {
     let interfaces = datalink::interfaces();
     let iface = interfaces.into_iter().find(|i| i.name == device_name)?;
     iface.ips.iter().find_map(|ip| {
-        if let pnet::ipnetwork::IpNetwork::V4(net) = ip {
-            Some(net.ip())
-        } else {
-            None
-        }
+        if let pnet::ipnetwork::IpNetwork::V4(net) = ip { Some(net.ip()) } else { None }
     })
 }
 
@@ -198,18 +240,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                         let dst = ipv4.get_destination();
 
                         let mut s = stats_clone.lock().unwrap();
-                        if src == local_ip {
-                            s.tx_delta += len;
-                        } else {
-                            s.rx_delta += len;
-                        }
-
-                        if is_lan_ip(&src) {
-                            *s.traffic_delta.entry(src).or_insert(0) += len;
-                        }
-                        if is_lan_ip(&dst) {
-                            *s.traffic_delta.entry(dst).or_insert(0) += len;
-                        }
+                        if src == local_ip { s.tx_delta += len; } else { s.rx_delta += len; }
+                        if is_lan_ip(&src) { *s.traffic_delta.entry(src).or_insert(0) += len; }
+                        if is_lan_ip(&dst) { *s.traffic_delta.entry(dst).or_insert(0) += len; }
                     }
                 }
             }
@@ -229,9 +262,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    if let Err(err) = res {
-        println!("{:?}", err)
-    }
+    if let Err(err) = res { println!("{:?}", err) }
     Ok(())
 }
 
@@ -251,11 +282,11 @@ fn run_app<B: ratatui::backend::Backend>(
                 .constraints([Constraint::Length(16), Constraint::Min(10)].as_ref())
                 .split(f.size());
 
-            // --- Net Box ---
+            // --- Net Box (Canvas) ---
             let net_block = Block::default()
                 .borders(Borders::ALL)
                 .title(format!(" net [{}] ", device_name))
-                .border_type(ratatui::widgets::BorderType::Rounded) // 圆角边框，像 btop
+                .border_type(ratatui::widgets::BorderType::Rounded)
                 .border_style(Style::default().fg(Color::White));
             f.render_widget(net_block.clone(), main_chunks[0]);
 
@@ -265,42 +296,27 @@ fn run_app<B: ratatui::backend::Backend>(
                 .constraints([Constraint::Percentage(70), Constraint::Percentage(30)].as_ref())
                 .split(inner_area);
 
-            // --- 关键修改：Canvas 绘图区域 ---
             let chart_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
                 .split(graph_chunks[0]);
 
-            // 计算Y轴上限，让图表看起来饱满
-            // 获取历史数据中的最大值，如果太小则设定一个最小值防止除以0
             let max_rx = app.rx_history.iter().cloned().fold(1.0, f64::max);
             let max_tx = app.tx_history.iter().cloned().fold(1.0, f64::max);
-            
-            // X轴长度 = 历史记录数量
             let x_limit = app.rx_history.len() as f64;
 
-            // 1. Download Canvas
             let download_canvas = Canvas::default()
                 .block(Block::default().title("Download").title_style(Style::default().fg(Color::Red)))
-                .marker(Marker::Braille) // 核心：使用盲文点阵
+                .marker(Marker::Braille)
                 .x_bounds([0.0, x_limit])
-                .y_bounds([0.0, max_rx]) // 动态Y轴
+                .y_bounds([0.0, max_rx])
                 .paint(|ctx| {
                     for (i, &val) in app.rx_history.iter().enumerate() {
-                        // 绘制竖线，营造填充效果
-                        // 从 y=0 画到 y=val
-                        ctx.draw(&CanvasLine {
-                            x1: i as f64,
-                            y1: 0.0,
-                            x2: i as f64,
-                            y2: val,
-                            color: Color::Red,
-                        });
+                        ctx.draw(&CanvasLine { x1: i as f64, y1: 0.0, x2: i as f64, y2: val, color: Color::Red });
                     }
                 });
             f.render_widget(download_canvas, chart_chunks[0]);
 
-            // 2. Upload Canvas
             let upload_canvas = Canvas::default()
                 .block(Block::default().title("Upload").title_style(Style::default().fg(Color::Blue)))
                 .marker(Marker::Braille)
@@ -308,18 +324,11 @@ fn run_app<B: ratatui::backend::Backend>(
                 .y_bounds([0.0, max_tx])
                 .paint(|ctx| {
                     for (i, &val) in app.tx_history.iter().enumerate() {
-                        ctx.draw(&CanvasLine {
-                            x1: i as f64,
-                            y1: 0.0,
-                            x2: i as f64,
-                            y2: val,
-                            color: Color::Blue,
-                        });
+                        ctx.draw(&CanvasLine { x1: i as f64, y1: 0.0, x2: i as f64, y2: val, color: Color::Blue });
                     }
                 });
             f.render_widget(upload_canvas, chart_chunks[1]);
 
-            // --- 右侧文字统计 ---
             let text_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
@@ -335,27 +344,43 @@ fn run_app<B: ratatui::backend::Backend>(
                 Line::from(vec![Span::styled("  Top: ", Style::default().fg(Color::DarkGray)), Span::raw(format_bps(peak_rx_bps))]),
                 Line::from(vec![Span::styled("  Tot: ", Style::default().fg(Color::DarkGray)), Span::raw(format_bytes_total(app.total_rx_bytes))]),
             ];
-            let rx_info = Paragraph::new(rx_text).block(Block::default().style(Style::default().fg(Color::Red)));
-            f.render_widget(rx_info, text_chunks[0]);
+            f.render_widget(Paragraph::new(rx_text).block(Block::default().style(Style::default().fg(Color::Red))), text_chunks[0]);
 
             let tx_text = vec![
                 Line::from(vec![Span::raw("▲ "), Span::styled(format_bps(current_tx_bps), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))]),
                 Line::from(vec![Span::styled("  Top: ", Style::default().fg(Color::DarkGray)), Span::raw(format_bps(peak_tx_bps))]),
                 Line::from(vec![Span::styled("  Tot: ", Style::default().fg(Color::DarkGray)), Span::raw(format_bytes_total(app.total_tx_bytes))]),
             ];
-            let tx_info = Paragraph::new(tx_text).block(Block::default().style(Style::default().fg(Color::Blue)));
-            f.render_widget(tx_info, text_chunks[1]);
+            f.render_widget(Paragraph::new(tx_text).block(Block::default().style(Style::default().fg(Color::Blue))), text_chunks[1]);
 
-            // --- 底部表格 ---
-            let header_cells = ["IP Address", "Avg Bandwidth (1 min)", "Status"].iter().map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow)));
+            // --- 底部表格 (含 Hostname 和 峰值信息) ---
+            let header_cells = ["IP Address", "Hostname", "Current Speed", "Peak Speed", "Peak Time"]
+                .iter()
+                .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
             let header = Row::new(header_cells).style(Style::default().bg(Color::Rgb(50, 50, 50))).height(1).bottom_margin(1);
-            let rows = app.top_talkers.iter().take(20).map(|(ip, bps)| {
+            
+            let rows = app.top_talkers.iter().take(20).map(|(ip, bps, hostname, peak_bps, peak_time)| {
                 let color = if *bps > 1_000_000.0 { Color::Red } else if *bps > 10_000.0 { Color::LightYellow } else { Color::Green };
-                Row::new(vec![Cell::from(ip.to_string()), Cell::from(format_bps(*bps)).style(Style::default().fg(color)), Cell::from("Active")]).height(1)
+                
+                Row::new(vec![
+                    Cell::from(ip.to_string()),
+                    Cell::from(hostname.clone()).style(Style::default().fg(Color::Cyan)), // Hostname 颜色
+                    Cell::from(format_bps(*bps)).style(Style::default().fg(color)),
+                    Cell::from(format_bps(*peak_bps)).style(Style::default().fg(Color::Gray)), // 峰值颜色
+                    Cell::from(peak_time.clone()).style(Style::default().fg(Color::DarkGray)), // 时间颜色
+                ]).height(1)
             });
-            let table = Table::new(rows, [Constraint::Percentage(40), Constraint::Percentage(40), Constraint::Percentage(20)])
+
+            // 调整列宽以容纳新数据
+            let table = Table::new(rows, [
+                    Constraint::Percentage(20), // IP
+                    Constraint::Percentage(30), // Hostname (长一点)
+                    Constraint::Percentage(15), // Current
+                    Constraint::Percentage(15), // Peak
+                    Constraint::Percentage(20), // Time
+                ])
                 .header(header)
-                .block(Block::default().title(" Local Network Users ").borders(Borders::ALL).border_type(ratatui::widgets::BorderType::Rounded));
+                .block(Block::default().title(" Network Users ").borders(Borders::ALL).border_type(ratatui::widgets::BorderType::Rounded));
             f.render_widget(table, main_chunks[1]);
         })?;
 
@@ -374,7 +399,7 @@ fn run_app<B: ratatui::backend::Backend>(
 
 fn is_lan_ip(ip: &Ipv4Addr) -> bool {
     let octets = ip.octets();
-    (octets[0] == 192 && octets[1] == 168) || (octets[0] == 10)
+    octets[0] == 192 && octets[1] == 168 && octets[2] == 5
 }
 
 fn format_bps(bps: f64) -> String {
