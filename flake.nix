@@ -14,15 +14,6 @@
         deps = with pkgs; [
           cargo
           rustc
-          udev 
-          alsa-lib 
-          vulkan-loader
-          xorg.libX11 
-          xorg.libXcursor 
-          xorg.libXi 
-          xorg.libXrandr # To use the x11 feature
-          libxkbcommon 
-          wayland # To use the wayland feature
           libpcap
         ];
       in
@@ -31,8 +22,6 @@
           src = ./.;
           nativeBuildInputs = with pkgs; [
             pkg-config
-            alsa-lib
-            udev
           ];
           buildInputs = [ deps ];
           shellHook = ''
@@ -44,8 +33,6 @@
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = with pkgs; [
             pkg-config
-            alsa-lib
-            udev
           ];
         buildInputs = [ deps ];
           shellHook = ''
